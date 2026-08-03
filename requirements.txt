@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+inngest
+qdrant-client
+streamlit
+requests
+openai
+pydantic
+pypdf
+fastembed
+python-dotenv
