@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import requests
 import streamlit as st
@@ -14,22 +15,37 @@ st.set_page_config(
 )
 
 
-def send_inngest_event(event_name: str, data: dict) -> dict:
-    """Send an event to the local Inngest dev server."""
-    payload = [{"name": event_name, "data": data}]
+def clean_source_id(name: str) -> str:
+    """Sanitize filename into a clean Source ID string."""
+    base = os.path.splitext(name)[0]
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", base).strip("_")
+
+
+def ingest_document(pdf_path: str, source_id: str) -> dict:
+    resp = requests.post(
+        f"{FASTAPI_BASE_URL}/ingest",
+        json={"pdf_path": pdf_path, "source_id": source_id, "replace_existing": True},
+        timeout=600,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_sources() -> list[str]:
     try:
-        resp = requests.post(INNGEST_DEV_URL, json=payload, timeout=30)
+        resp = requests.get(f"{FASTAPI_BASE_URL}/sources", timeout=10)
         resp.raise_for_status()
-        return resp.json()
+        return resp.json().get("sources", [])
     except Exception:
-        payload = {"name": event_name, "data": data}
-        resp = requests.post(INNGEST_DEV_URL, json=payload, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+        return []
+
+
+if "active_source_id" not in st.session_state:
+    st.session_state.active_source_id = ""
 
 
 st.title("📄 RAG Institute Assistant")
-st.caption("Upload documents via LlamaIndex & Inngest, then ask questions grounded in vector context.")
+st.caption("Upload documents via LlamaIndex & Inngest, then ask questions answered by an LLM using retrieved document context.")
 
 tab_ingest, tab_ask = st.tabs(["📥 Ingest Document", "💬 Ask a Question"])
 
@@ -37,39 +53,45 @@ tab_ingest, tab_ask = st.tabs(["📥 Ingest Document", "💬 Ask a Question"])
 with tab_ingest:
     st.subheader("Upload a PDF Document")
     uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
+
+    default_source = ""
+    if uploaded_file:
+        default_source = clean_source_id(uploaded_file.name)
+
     source_id = st.text_input(
         "Source ID (unique name for this document)",
+        value=default_source,
         placeholder="e.g., attendance_policy_2026",
     )
 
     if st.button("Ingest Document", type="primary", disabled=not (uploaded_file and source_id)):
-        with st.spinner("Saving file and triggering Inngest pipeline..."):
+        with st.spinner("Saving file, extracting text, embedding chunks, and updating Qdrant..."):
+            tmp_path = None
             try:
-                # Save uploaded file to a temporary location for background worker reading
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                     tmp.write(uploaded_file.getbuffer())
                     tmp_path = tmp.name
 
-                send_inngest_event(
-                    "rag/ingest_pdf",
-                    {"pdf_path": tmp_path, "source_id": source_id},
-                )
+                result = ingest_document(tmp_path, source_id)
+                st.session_state.active_source_id = source_id
                 st.success(
-                    f"Ingestion event triggered for '{source_id}'. "
-                    "Track progress in the Inngest Dev Dashboard (http://127.0.0.1:8288)."
+                    f"Ingested '{source_id}' successfully "
+                    f"({result.get('chunks_ingested', 0)} chunks). You can ask questions now."
                 )
             except requests.exceptions.ConnectionError:
                 st.error(
-                    "Could not reach the Inngest dev server at "
-                    f"{INNGEST_DEV_URL}. Make sure it is running (`npx inngest-cli@latest dev`)."
+                    "Could not reach the FastAPI backend at "
+                    f"{FASTAPI_BASE_URL}. Make sure it is running (`uv run python main.py`)."
                 )
             except Exception as e:
-                st.error(f"Ingestion trigger failed: {e}")
+                st.error(f"Ingestion failed: {e}")
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
 
     st.divider()
     st.caption(
-        "Note: Ingestion is throttled (max 2/min) and rate-limited per source ID "
-        "(1 per 4 hours) to protect server resources."
+        "Ingestion replaces previous chunks with the same Source ID, so re-uploading a book keeps retrieval clean."
     )
 
 # ── Tab 2: Ask ──────────────────────────────────────────────────────────────
@@ -77,13 +99,23 @@ with tab_ask:
     st.subheader("Ask a Question")
     question = st.text_input("Your question", placeholder="e.g., What is the attendance policy?")
     top_k = st.slider("Number of context chunks to retrieve (top_k)", min_value=1, max_value=10, value=5)
+    available_sources = fetch_sources()
+    source_options = ["All documents", *available_sources]
+    default_index = 0
+    if st.session_state.active_source_id in available_sources:
+        default_index = source_options.index(st.session_state.active_source_id)
+    selected_source = st.selectbox("Document scope", source_options, index=default_index)
+    source_id_filter = None if selected_source == "All documents" else selected_source
 
     if st.button("Ask", type="primary", disabled=not question):
         with st.spinner("Searching Qdrant vector index and generating answer via OpenRouter..."):
             try:
+                payload = {"question": question, "top_k": top_k}
+                if source_id_filter:
+                    payload["source_id"] = source_id_filter
                 resp = requests.post(
                     f"{FASTAPI_BASE_URL}/ask",
-                    json={"question": question, "top_k": top_k},
+                    json=payload,
                     timeout=60,
                 )
                 resp.raise_for_status()
@@ -111,4 +143,4 @@ with tab_ask:
                 st.error(f"Query failed: {e}")
 
     st.divider()
-    st.caption("Answers are generated strictly from ingested document content using Llama 3.1 8B Instruct.")
+    st.caption("Answers are generated by the configured OpenRouter LLM and grounded in the retrieved document context.")
