@@ -1,11 +1,17 @@
-fastapi
-uvicorn
-inngest
-qdrant-client
-streamlit
-requests
-openai
-pydantic
-pypdf
-fastembed
-python-dotenv
+fastapi==0.95.2
+uvicorn==0.21.1
+inngest==0.14.0
+qdrant-client==1.5.2
+streamlit==1.24.0
+requests==2.31.0
+openai==1.9.0
+# Use pydantic v1 for compatibility with some dependencies; v2 may also work
+pydantic==1.10.12
+pypdf==3.14.0
+fastembed==0.4.0
+python-dotenv==1.0.0
+
+# Optional / heavy ML deps (uncomment to install)
+# llama-index==0.10.13
+# transformers==4.35.0
+# torch==2.2.0

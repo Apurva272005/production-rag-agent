@@ -1,5 +1,4 @@
 import os
-import re
 import tempfile
 import requests
 import streamlit as st
@@ -15,33 +14,42 @@ st.set_page_config(
 )
 
 
-def clean_source_id(name: str) -> str:
-    """Sanitize filename into a clean Source ID string."""
-    base = os.path.splitext(name)[0]
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", base).strip("_")
+def send_inngest_event(event_name: str, data: dict) -> dict:
+    """Send an event to the local Inngest dev server."""
+    payload = [{"name": event_name, "data": data}]
+    try:
+        resp = requests.post(INNGEST_DEV_URL, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        payload = {"name": event_name, "data": data}
+        resp = requests.post(INNGEST_DEV_URL, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
 
 
-def ingest_document(pdf_path: str, source_id: str) -> dict:
+def ingest_document_direct(uploaded_file, source_id: str) -> dict:
+    """Upload PDF directly to backend server via multipart file upload."""
+    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
+    data = {"source_id": source_id, "replace_existing": "true"}
     resp = requests.post(
-        f"{FASTAPI_BASE_URL}/ingest",
-        json={"pdf_path": pdf_path, "source_id": source_id, "replace_existing": True},
+        f"{FASTAPI_BASE_URL}/upload",
+        files=files,
+        data=data,
         timeout=600,
     )
+    if resp.status_code >= 400:
+        try:
+            res_data = resp.json()
+            detail = res_data.get("detail") if isinstance(res_data, dict) else resp.text
+            if detail:
+                raise RuntimeError(detail)
+        except Exception as err:
+            if isinstance(err, RuntimeError):
+                raise err
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
     resp.raise_for_status()
     return resp.json()
-
-
-def fetch_sources() -> list[str]:
-    try:
-        resp = requests.get(f"{FASTAPI_BASE_URL}/sources", timeout=10)
-        resp.raise_for_status()
-        return resp.json().get("sources", [])
-    except Exception:
-        return []
-
-
-if "active_source_id" not in st.session_state:
-    st.session_state.active_source_id = ""
 
 
 st.title("📄 RAG Institute Assistant")
@@ -56,68 +64,81 @@ with tab_ingest:
 
     default_source = ""
     if uploaded_file:
-        default_source = clean_source_id(uploaded_file.name)
+        raw_name = os.path.splitext(uploaded_file.name)[0]
+        default_source = "".join(c if (c.isalnum() or c in "_-") else "_" for c in raw_name)
 
     source_id = st.text_input(
         "Source ID (unique name for this document)",
         value=default_source,
-        placeholder="e.g., attendance_policy_2026",
+        placeholder="e.g., Hands_On_Machine_Learning",
     )
 
     if st.button("Ingest Document", type="primary", disabled=not (uploaded_file and source_id)):
-        with st.spinner("Saving file, extracting text, embedding chunks, and updating Qdrant..."):
-            tmp_path = None
+        with st.spinner("Uploading PDF, embedding chunks, and storing vectors..."):
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_file.getbuffer())
-                    tmp_path = tmp.name
-
-                result = ingest_document(tmp_path, source_id)
-                st.session_state.active_source_id = source_id
+                res = ingest_document_direct(uploaded_file, source_id)
                 st.success(
-                    f"Ingested '{source_id}' successfully "
-                    f"({result.get('chunks_ingested', 0)} chunks). You can ask questions now."
+                    f"Successfully ingested '{source_id}' ({res.get('chunks_ingested', 0)} chunks stored)."
                 )
+
+                # Save temporary copy for background Inngest event
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(uploaded_file.getbuffer())
+                        tmp_path = tmp.name
+
+                    send_inngest_event(
+                        "rag/ingest_pdf",
+                        {"pdf_path": tmp_path, "source_id": source_id},
+                    )
+                except Exception:
+                    pass
             except requests.exceptions.ConnectionError:
                 st.error(
-                    "Could not reach the FastAPI backend at "
-                    f"{FASTAPI_BASE_URL}. Make sure it is running (`uv run python main.py`)."
+                    f"Could not reach the FastAPI backend at {FASTAPI_BASE_URL}. "
+                    "Make sure it is running (`uv run python main.py`)."
                 )
             except Exception as e:
                 st.error(f"Ingestion failed: {e}")
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
 
     st.divider()
-    st.caption(
-        "Ingestion replaces previous chunks with the same Source ID, so re-uploading a book keeps retrieval clean."
-    )
+    st.caption("Ingestion replaces previous chunks with the same Source ID, so re-uploading a book keeps retrieval clean.")
 
 # ── Tab 2: Ask ──────────────────────────────────────────────────────────────
 with tab_ask:
     st.subheader("Ask a Question")
-    question = st.text_input("Your question", placeholder="e.g., What is the attendance policy?")
-    top_k = st.slider("Number of context chunks to retrieve (top_k)", min_value=1, max_value=10, value=5)
-    available_sources = fetch_sources()
-    source_options = ["All documents", *available_sources]
-    default_index = 0
-    if st.session_state.active_source_id in available_sources:
-        default_index = source_options.index(st.session_state.active_source_id)
-    selected_source = st.selectbox("Document scope", source_options, index=default_index)
-    source_id_filter = None if selected_source == "All documents" else selected_source
+    question = st.text_input("Your question", placeholder="e.g., Explain supervised learning.")
+
+    available_sources = ["All documents"]
+    try:
+        s_resp = requests.get(f"{FASTAPI_BASE_URL}/sources", timeout=5)
+        if s_resp.status_code == 200:
+            available_sources.extend(s_resp.json().get("sources", []))
+    except Exception:
+        pass
+
+    selected_source = st.selectbox("Document Scope Filter", available_sources)
+    top_k = st.slider("Number of context chunks to retrieve (top_k)", min_value=1, max_value=20, value=5)
 
     if st.button("Ask", type="primary", disabled=not question):
-        with st.spinner("Searching Qdrant vector index and generating answer via OpenRouter..."):
+        with st.spinner("Searching Qdrant vector index and generating answer via LLM..."):
             try:
                 payload = {"question": question, "top_k": top_k}
-                if source_id_filter:
-                    payload["source_id"] = source_id_filter
+                if selected_source and selected_source != "All documents":
+                    payload["source_id"] = selected_source
+
                 resp = requests.post(
                     f"{FASTAPI_BASE_URL}/ask",
                     json=payload,
                     timeout=60,
                 )
+                if resp.status_code >= 400:
+                    try:
+                        detail = resp.json().get("detail")
+                        if detail:
+                            raise RuntimeError(detail)
+                    except Exception:
+                        pass
                 resp.raise_for_status()
                 result = resp.json()
 
@@ -136,11 +157,11 @@ with tab_ask:
 
             except requests.exceptions.ConnectionError:
                 st.error(
-                    "Could not reach the FastAPI backend. "
-                    f"Make sure it is running (`uv run python main.py` or `uvicorn main:app --reload`)."
+                    f"Could not reach the FastAPI backend at {FASTAPI_BASE_URL}. "
+                    "Make sure it is running (`uv run python main.py`)."
                 )
             except Exception as e:
                 st.error(f"Query failed: {e}")
 
     st.divider()
-    st.caption("Answers are generated by the configured OpenRouter LLM and grounded in the retrieved document context.")
+    st.caption("Answers are generated strictly from ingested document content using free LLM models via OpenRouter.")

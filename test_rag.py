@@ -1,6 +1,8 @@
 import os
 import unittest
-from main import extract_text_and_chunk, QdrantStorage, embed_texts
+from data_loader import embed_texts
+from vector_db import QdrantStorage
+
 
 class TestRAGComponents(unittest.TestCase):
     def test_embedding_generation(self):
