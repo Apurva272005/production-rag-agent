@@ -29,7 +29,7 @@ def send_inngest_event(event_name: str, data: dict) -> dict:
 
 
 def ingest_document_direct(uploaded_file, source_id: str) -> dict:
-    """Upload PDF directly to backend server via multipart file upload."""
+    """Upload single PDF directly to backend server via multipart file upload."""
     files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
     data = {"source_id": source_id, "replace_existing": "true"}
     resp = requests.post(
@@ -55,51 +55,58 @@ def ingest_document_direct(uploaded_file, source_id: str) -> dict:
 st.title("📄 RAG Institute Assistant")
 st.caption("Upload documents via LlamaIndex & Inngest, then ask questions answered by an LLM using retrieved document context.")
 
-tab_ingest, tab_ask = st.tabs(["📥 Ingest Document", "💬 Ask a Question"])
+tab_ingest, tab_ask = st.tabs(["📥 Ingest Document(s)", "💬 Ask a Question"])
 
-# ── Tab 1: Ingest ───────────────────────────────────────────────────────────
+# ── Tab 1: Ingest Multiple Documents ─────────────────────────────────────────
 with tab_ingest:
-    st.subheader("Upload a PDF Document")
-    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
-
-    default_source = ""
-    if uploaded_file:
-        raw_name = os.path.splitext(uploaded_file.name)[0]
-        default_source = "".join(c if (c.isalnum() or c in "_-") else "_" for c in raw_name)
-
-    source_id = st.text_input(
-        "Source ID (unique name for this document)",
-        value=default_source,
-        placeholder="e.g., Hands_On_Machine_Learning",
+    st.subheader("Upload PDF Documents")
+    uploaded_files = st.file_uploader(
+        "Choose one or multiple PDF files",
+        type=["pdf"],
+        accept_multiple_files=True,
     )
 
-    if st.button("Ingest Document", type="primary", disabled=not (uploaded_file and source_id)):
-        with st.spinner("Uploading PDF, embedding chunks, and storing vectors..."):
-            try:
-                res = ingest_document_direct(uploaded_file, source_id)
-                st.success(
-                    f"Successfully ingested '{source_id}' ({res.get('chunks_ingested', 0)} chunks stored)."
-                )
+    if uploaded_files:
+        st.write(f"📁 **{len(uploaded_files)} PDF file(s) selected:**")
+        file_source_map = {}
+        for idx, f in enumerate(uploaded_files):
+            raw_name = os.path.splitext(f.name)[0]
+            clean_source = "".join(c if (c.isalnum() or c in "_-") else "_" for c in raw_name)
+            file_source_map[f] = clean_source
+            st.caption(f"• `{f.name}` ({f.size / (1024*1024):.1f} MB) ➔ Source ID: `{clean_source}`")
 
-                # Save temporary copy for background Inngest event
+        if st.button("Ingest All Documents", type="primary"):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            total_files = len(uploaded_files)
+            success_count = 0
+            total_chunks = 0
+
+            for idx, file in enumerate(uploaded_files):
+                src_id = file_source_map[file]
+                status_text.text(f"Processing {idx+1}/{total_files}: '{file.name}'...")
+                
                 try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                        tmp.write(uploaded_file.getbuffer())
-                        tmp_path = tmp.name
-
-                    send_inngest_event(
-                        "rag/ingest_pdf",
-                        {"pdf_path": tmp_path, "source_id": source_id},
+                    res = ingest_document_direct(file, src_id)
+                    chunks = res.get("chunks_ingested", 0)
+                    total_chunks += chunks
+                    success_count += 1
+                    st.success(f"✅ Ingested '{src_id}' ({chunks} chunks stored).")
+                except requests.exceptions.ConnectionError:
+                    st.error(
+                        f"Could not reach the FastAPI backend at {FASTAPI_BASE_URL}. "
+                        "Make sure it is running (`uv run python main.py`)."
                     )
-                except Exception:
-                    pass
-            except requests.exceptions.ConnectionError:
-                st.error(
-                    f"Could not reach the FastAPI backend at {FASTAPI_BASE_URL}. "
-                    "Make sure it is running (`uv run python main.py`)."
-                )
-            except Exception as e:
-                st.error(f"Ingestion failed: {e}")
+                    break
+                except Exception as e:
+                    st.error(f"❌ Ingestion failed for '{file.name}': {e}")
+                
+                progress_bar.progress((idx + 1) / total_files)
+
+            status_text.text("Finished processing all documents!")
+            if success_count > 0:
+                st.balloons()
+                st.info(f"🎉 **Batch Ingestion Summary**: Successfully ingested {success_count}/{total_files} file(s) ({total_chunks} total chunks stored in Qdrant Cloud).")
 
     st.divider()
     st.caption("Ingestion replaces previous chunks with the same Source ID, so re-uploading a book keeps retrieval clean.")

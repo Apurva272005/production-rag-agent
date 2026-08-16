@@ -2,7 +2,7 @@ import os
 os.environ["NLTK_DISABLE_IMPORT_SECURITY"] = "1"
 import tempfile
 from datetime import timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -118,6 +118,13 @@ async def ingest_pdf(ctx: inngest.Context, step: inngest.Step) -> Dict[str, Any]
     if not pdf_path or not source_id:
         raise ValueError("Missing pdf_path or source_id in event data")
 
+    if not os.path.exists(pdf_path):
+        return {
+            "status": "completed_via_direct_upload",
+            "source_id": source_id,
+            "message": f"File {pdf_path} was already processed and cleaned up."
+        }
+
     replace_existing = ctx.event.data.get("replace_existing", True)
 
     # Step 1: Read and chunk PDF via LlamaIndex
@@ -214,6 +221,42 @@ async def upload_file(
                 os.unlink(temp_path)
             except Exception:
                 pass
+
+
+@app.post("/upload-batch")
+async def upload_multiple_files(
+    files: List[UploadFile] = File(...),
+    replace_existing: bool = Form(True),
+) -> Dict[str, Any]:
+    """Upload and ingest multiple PDF files simultaneously."""
+    results = []
+    total_chunks = 0
+    for file in files:
+        temp_path = None
+        try:
+            raw_name = os.path.splitext(file.filename)[0]
+            target_source = "".join(c if (c.isalnum() or c in "_-") else "_" for c in raw_name)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                content = await file.read()
+                tmp.write(content)
+                temp_path = tmp.name
+            res = ingest_pdf_file(temp_path, target_source, replace_existing)
+            results.append(res.model_dump())
+            total_chunks += res.chunks_ingested
+        except Exception as err:
+            results.append({"status": "failed", "source_id": file.filename, "error": str(err), "chunks_ingested": 0})
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+    return {
+        "status": "completed",
+        "total_files": len(files),
+        "total_chunks_ingested": total_chunks,
+        "details": results
+    }
 
 
 @app.get("/sources")
