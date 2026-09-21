@@ -17,10 +17,13 @@ from vector_db import get_qdrant_storage
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 DEFAULT_OPENROUTER_MODELS = [
+    "minimax/minimax-m3:free",
+    "poolside/laguna-s-2.1:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3.5-lightning:free",
     "google/gemma-4-31b-it:free",
-    "nvidia/nemotron-nano-9b-v2:free",
     "google/gemma-4-26b-a4b-it:free",
-    "openai/gpt-oss-20b:free",
 ]
 
 
@@ -28,7 +31,7 @@ def get_openrouter_models() -> list[str]:
     configured_model = os.getenv("OPENROUTER_MODEL", "").strip()
     if configured_model:
         return [configured_model, *[model for model in DEFAULT_OPENROUTER_MODELS if model != configured_model]]
-    return DEFAULT_OPENROUTER_MODELS
+    return list(DEFAULT_OPENROUTER_MODELS)
 
 
 def build_context_block(matches: list[dict[str, Any]]) -> str:
@@ -315,22 +318,65 @@ async def ask(req: AskRequest) -> AskResponse:
     answer = None
     last_error = None
 
-    for model_name in get_openrouter_models():
+    models_to_try = get_openrouter_models()
+
+    for model_name in models_to_try:
         try:
             completion = client.chat.completions.create(
                 model=model_name,
                 max_tokens=1600,
                 temperature=0.3,
                 messages=messages,
-                timeout=30.0,
+                timeout=25.0,
             )
 
-            if completion.choices and completion.choices[0].message.content:
-                answer = completion.choices[0].message.content.strip()
-                break
+            choice = completion.choices[0] if completion.choices else None
+            if choice and choice.message:
+                raw_text = choice.message.content or ""
+                if not raw_text.strip() and hasattr(choice.message, "reasoning"):
+                    raw_text = getattr(choice.message, "reasoning") or ""
+                if raw_text.strip():
+                    answer = raw_text.strip()
+                    break
         except Exception as err:
             last_error = str(err)
             continue
+
+    # Fallback to dynamically discovered free models if all static models failed
+    if not answer:
+        try:
+            import requests
+            resp = requests.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                available = resp.json().get("data", [])
+                dynamic_free = [
+                    m["id"] for m in available
+                    if ":free" in m.get("id", "") and m.get("id") not in models_to_try
+                ]
+                for model_name in dynamic_free[:5]:
+                    try:
+                        completion = client.chat.completions.create(
+                            model=model_name,
+                            max_tokens=1600,
+                            temperature=0.3,
+                            messages=messages,
+                            timeout=25.0,
+                        )
+                        choice = completion.choices[0] if completion.choices else None
+                        if choice and choice.message:
+                            raw_text = choice.message.content or ""
+                            if raw_text.strip():
+                                answer = raw_text.strip()
+                                break
+                    except Exception as err:
+                        last_error = str(err)
+                        continue
+        except Exception:
+            pass
 
     if not answer:
         if last_error:
