@@ -1,7 +1,25 @@
 import os
 os.environ["NLTK_DISABLE_IMPORT_SECURITY"] = "1"
 import hashlib
-from typing import List, Optional
+from typing import List, Dict, Any, Optional
+from PIL import Image
+import io
+
+try:
+    import pymupdf
+    _HAS_PYMUPDF = True
+except Exception:
+    try:
+        import fitz as pymupdf
+        _HAS_PYMUPDF = True
+    except Exception:
+        _HAS_PYMUPDF = False
+
+try:
+    import pytesseract
+    _HAS_PYTESSERACT = True
+except Exception:
+    _HAS_PYTESSERACT = False
 
 try:
     from llama_index.core import SimpleDirectoryReader
@@ -16,7 +34,6 @@ try:
 except Exception:
     _HAS_FASTEMBED = False
 
-# Lazy singleton embedding model instance (may be a fastembed model or None)
 _embedding_model: Optional[object] = None
 
 
@@ -32,16 +49,11 @@ def get_embedding_model() -> Optional[object]:
 
 
 def _deterministic_hash_vector(text: str, dim: int = 384) -> List[float]:
-    """Create a deterministic pseudo-embedding from a SHA256 hash.
-
-    Produces floats in range [-1,1]. Used as a fallback for tests and
-    environments without the heavy embedding dependency.
-    """
+    """Create a deterministic pseudo-embedding from a SHA256 hash."""
     h = hashlib.sha256(text.encode("utf-8", "ignore")).digest()
     vals = []
     i = 0
     while len(vals) < dim:
-        # Expand by hashing with counter
         chunk = hashlib.sha256(h + i.to_bytes(2, "big")).digest()
         for b in chunk:
             if len(vals) >= dim:
@@ -52,12 +64,7 @@ def _deterministic_hash_vector(text: str, dim: int = 384) -> List[float]:
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    """Generate 384-dimensional vector embeddings for input texts.
-
-    Uses `fastembed` when available; otherwise falls back to a deterministic
-    hashed-vector implementation so unit tests and CI can run without
-    downloading models.
-    """
+    """Generate 384-dimensional vector embeddings for input texts."""
     if not texts:
         return []
 
@@ -69,66 +76,114 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
         except Exception:
             pass
 
-    # Fallback deterministic vectors
     return [_deterministic_hash_vector(t, dim=384) for t in texts]
 
 
-def load_and_chunk_pdf(pdf_path: str, chunk_size: int = 500, chunk_overlap: int = 50) -> List[str]:
-    """Load PDF and split into text chunks.
+def _try_ocr_page_image(pil_img: Image.Image) -> str:
+    """Run pytesseract on a PIL Image if available."""
+    if not _HAS_PYTESSERACT:
+        return ""
+    try:
+        text = pytesseract.image_to_string(pil_img)
+        return text.strip()
+    except Exception:
+        return ""
 
-    Prefer `llama_index` when available; otherwise use a simple extraction
-    via `pypdf` and a character-based chunking strategy.
-    """
+
+def load_and_chunk_pdf_structured(
+    pdf_path: str,
+    chunk_size: int = 500,
+    chunk_overlap: int = 50,
+) -> List[Dict[str, Any]]:
+    """Load PDF and split into structured chunks with page numbers and OCR tagging."""
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF file not found at path: {pdf_path}")
 
-    if _HAS_LLAMA_INDEX:
-        reader = SimpleDirectoryReader(input_files=[pdf_path])
-        documents = reader.load_data()
-        if not documents:
-            return []
-        
-        # Clean UTF-8 surrogates to prevent sha256 hash encoding errors
-        for doc in documents:
-            content = doc.get_content()
-            if content:
-                clean_content = content.encode("utf-8", "ignore").decode("utf-8")
-                doc.set_content(clean_content)
+    chunks_data: List[Dict[str, Any]] = []
 
-        splitter = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        nodes = splitter.get_nodes_from_documents(documents)
-        chunks = [node.get_content().strip() for node in nodes if node.get_content().strip()]
-        return chunks
+    # 1. Primary Engine: PyMuPDF with per-page text & OCR fallback
+    if _HAS_PYMUPDF:
+        try:
+            doc = pymupdf.open(pdf_path)
+            for page_index in range(len(doc)):
+                page_num = page_index + 1
+                page = doc[page_index]
+                text = page.get_text() or ""
+                ocr_used = False
 
-    # Lightweight fallback: extract text using pypdf and simple sliding-window
+                # If text is nearly empty, try OCR on this page
+                if len(text.strip()) < 40 and _HAS_PYTESSERACT:
+                    try:
+                        pix = page.get_pixmap(dpi=150)
+                        pil_img = Image.open(io.BytesIO(pix.tobytes("png")))
+                        ocr_text = _try_ocr_page_image(pil_img)
+                        if len(ocr_text.strip()) > len(text.strip()):
+                            text = ocr_text
+                            ocr_used = True
+                    except Exception:
+                        pass
+
+                # Clean UTF-8 surrogates
+                clean_text = text.encode("utf-8", "ignore").decode("utf-8").strip()
+                if not clean_text:
+                    continue
+
+                # Sliding window chunking per page
+                start = 0
+                while start < len(clean_text):
+                    end = start + chunk_size
+                    chunk = clean_text[start:end].strip()
+                    if chunk:
+                        chunks_data.append({
+                            "text": chunk,
+                            "page_number": page_num,
+                            "ocr_used": ocr_used,
+                        })
+                    start = max(0, end - chunk_overlap)
+                    if start >= len(clean_text) or end >= len(clean_text):
+                        break
+
+            doc.close()
+            if chunks_data:
+                return chunks_data
+        except Exception:
+            pass
+
+    # 2. PyPDF fallback
     try:
         from pypdf import PdfReader
+        reader = PdfReader(pdf_path)
+        for page_index, page in enumerate(reader.pages):
+            page_num = page_index + 1
+            txt = (page.extract_text() or "").encode("utf-8", "ignore").decode("utf-8").strip()
+            if not txt:
+                continue
+
+            start = 0
+            while start < len(txt):
+                end = start + chunk_size
+                chunk = txt[start:end].strip()
+                if chunk:
+                    chunks_data.append({
+                        "text": chunk,
+                        "page_number": page_num,
+                        "ocr_used": False,
+                    })
+                start = max(0, end - chunk_overlap)
+                if start >= len(txt) or end >= len(txt):
+                    break
+        return chunks_data
     except Exception:
-        raise RuntimeError("No PDF backend available (install 'llama-index' or 'pypdf').")
+        pass
 
-    reader = PdfReader(pdf_path)
-    full_text = []
-    for page in reader.pages:
-        try:
-            txt = page.extract_text() or ""
-        except Exception:
-            txt = ""
-        full_text.append(txt)
+    return []
 
-    text = "\n".join(full_text).strip()
-    if not text:
-        return []
 
-    # Clean UTF-8 surrogates
-    text = text.encode("utf-8", "ignore").decode("utf-8")
-
-    # Simple chunking by characters with overlap
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        start = max(0, end - chunk_overlap)
-    return chunks
+def load_and_chunk_pdf(
+    pdf_path: str,
+    chunk_size: int = 500,
+    chunk_overlap: int = 50,
+) -> List[str]:
+    """Backwards-compatible wrapper returning plain text chunks."""
+    structured = load_and_chunk_pdf_structured(pdf_path, chunk_size, chunk_overlap)
+    return [c["text"] for c in structured]

@@ -12,6 +12,8 @@ __pycache__/
 # Local Vector Storage & Caches
 qdrant_db/
 test_qdrant_db/
+rag_assistant.db
+storage/*.pdf
 .cache/
 
 # IDE & OS
