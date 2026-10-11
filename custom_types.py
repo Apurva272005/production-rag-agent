@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field
 class IngestPDFData(BaseModel):
     pdf_path: str = Field(..., description="Absolute path to the PDF file on disk")
     source_id: str = Field(..., description="Unique identifier for the ingested document source")
-    visibility: str = Field(default="public", description="Document visibility: public or private")
+    visibility: str = Field(default="public", description="public, student, faculty, or admin")
+    department: Optional[str] = None
     replace_existing: bool = Field(default=True, description="Replace existing chunks for this source before ingesting")
 
 
@@ -14,6 +15,7 @@ class IngestResult(BaseModel):
     source_id: str
     chunks_ingested: int
     visibility: str = "public"
+    department: Optional[str] = None
 
 
 class AskRequest(BaseModel):
@@ -50,4 +52,7 @@ class DocumentChunk(BaseModel):
     page_number: int = 1
     ocr_used: bool = False
     visibility: str = "public"
+    owner_id: Optional[str] = None
+    department: Optional[str] = None
+    doc_id: Optional[str] = None
     embedding: Optional[List[float]] = None

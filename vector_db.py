@@ -10,6 +10,7 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    MatchAny,
     PayloadSchemaType,
 )
 
@@ -59,6 +60,12 @@ class QdrantStorage:
                     field_name="visibility",
                     field_schema=PayloadSchemaType.KEYWORD,
                 )
+                for field_name in ("owner_id", "department", "doc_id"):
+                    self.client.create_payload_index(
+                        collection_name=COLLECTION_NAME,
+                        field_name=field_name,
+                        field_schema=PayloadSchemaType.KEYWORD,
+                    )
             except Exception:
                 pass
         except Exception:
@@ -77,13 +84,14 @@ class QdrantStorage:
         except Exception:
             pass
 
-    def list_sources(self, visibility: Optional[str] = None) -> List[str]:
+    def list_sources(self, visibility: Optional[str] = None, access_filter: Optional[Filter] = None) -> List[str]:
         try:
-            scroll_filter = None
+            filters = []
             if visibility:
-                scroll_filter = Filter(
-                    must=[FieldCondition(key="visibility", match=MatchValue(value=visibility))]
-                )
+                filters.append(FieldCondition(key="visibility", match=MatchValue(value=visibility)))
+            if access_filter:
+                filters.append(access_filter)
+            scroll_filter = Filter(must=filters) if filters else None
             scroll_res, _ = self.client.scroll(
                 collection_name=COLLECTION_NAME,
                 scroll_filter=scroll_filter,
@@ -116,9 +124,14 @@ class QdrantStorage:
         chunks: List[Union[str, Dict[str, Any]]],
         vectors: List[List[float]],
         visibility: str = "public",
+        owner_id: Optional[str] = None,
+        department: Optional[str] = None,
+        doc_id: Optional[str] = None,
     ) -> int:
         if not chunks or not vectors:
             return 0
+        if len(chunks) != len(vectors):
+            raise ValueError("chunks and vectors must have the same length")
 
         points = []
         for chunk_item, vector in zip(chunks, vectors):
@@ -136,6 +149,9 @@ class QdrantStorage:
                 "text": text,
                 "source_id": source_id,
                 "visibility": visibility,
+                "owner_id": owner_id,
+                "department": department,
+                "doc_id": doc_id or source_id,
                 "page_number": page_number,
                 "ocr_used": ocr_used,
             }
@@ -177,12 +193,15 @@ class QdrantStorage:
         top_k: int = 5,
         source_id: Optional[str] = None,
         visibility: Optional[str] = None,
+        access_filter: Optional[Filter] = None,
     ) -> Dict[str, Any]:
         filter_conditions = []
         if source_id and source_id.strip() and source_id.strip() != "All documents":
             filter_conditions.append(FieldCondition(key="source_id", match=MatchValue(value=source_id.strip())))
         if visibility:
             filter_conditions.append(FieldCondition(key="visibility", match=MatchValue(value=visibility.strip())))
+        if access_filter:
+            filter_conditions.append(access_filter)
 
         query_filter = Filter(must=filter_conditions) if filter_conditions else None
 
@@ -204,6 +223,8 @@ class QdrantStorage:
                         "page_number": p.payload.get("page_number", 1),
                         "ocr_used": p.payload.get("ocr_used", False),
                         "visibility": p.payload.get("visibility", "public"),
+                        "owner_id": p.payload.get("owner_id"),
+                        "department": p.payload.get("department"),
                     }
                     for p in points if p.payload
                 ]
@@ -228,6 +249,8 @@ class QdrantStorage:
                         "page_number": hit.payload.get("page_number", 1),
                         "ocr_used": hit.payload.get("ocr_used", False),
                         "visibility": hit.payload.get("visibility", "public"),
+                        "owner_id": hit.payload.get("owner_id"),
+                        "department": hit.payload.get("department"),
                     }
                     for hit in search_results if hit.payload
                 ]

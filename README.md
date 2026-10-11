@@ -6,7 +6,7 @@ This repo includes safe fallbacks so tests and local development work without do
 
 **Key files**
 - `main.py` — FastAPI backend and Inngest functions
-- `app.py` / `streamlit_app.py` — Streamlit UI
+- `streamlit_app.py` — Clerk-authenticated Streamlit UI (`app.py` is a compatibility wrapper)
 - `data_loader.py` — embedding & PDF chunking (uses `fastembed`/`llama-index` if available, otherwise deterministic fallback)
 - `vector_db.py` — Qdrant wrapper with in-memory fallback for tests
 
@@ -57,10 +57,10 @@ uvicorn main:app --reload --host 127.0.0.1 --port 8000
 npx inngest-cli@latest dev
 ```
 
-3. Start the Streamlit UI:
+3. Start the Clerk-authenticated Streamlit UI:
 
 ```bash
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
 Now open: `http://localhost:8501` to use the UI.
@@ -97,5 +97,15 @@ pytest -q
 ## Notes
 - `data_loader.py` provides deterministic hashed embeddings when `fastembed` is not installed so development and CI are deterministic and fast.
 - `vector_db.py` will use the installed `qdrant-client` when available; otherwise it uses an in-memory store for upsert/search so the app and tests still function without a running Qdrant server.
+
+## Clerk RBAC
+
+The production authentication source is Clerk. Set `CLERK_SECRET_KEY`, `CLERK_PUBLISHABLE_KEY`, `CLERK_JWKS_URL`, `CLERK_ISSUER`, `CLERK_AUTHORIZED_PARTIES`, and `CLERK_JWT_TEMPLATE` in `.env`. Roles and optional faculty departments are read only from verified Clerk `public_metadata` claims. See [docs/clerk_rbac.md](docs/clerk_rbac.md) for dashboard setup, migration, role assignment, and the permission matrix.
+
+Run the Clerk-specific tests with:
+
+```bash
+uv run pytest -q test_clerk_rbac.py
+```
 
 If you'd like, I can update `requirements.txt` to pin versions or add a `docker-compose.yml` for a full reproducible local stack.

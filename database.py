@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./rag_assistant.db")
@@ -22,3 +22,23 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def ensure_rbac_schema() -> None:
+    """Add Clerk/RBAC columns to an existing SQLite database without data loss."""
+    inspector = inspect(engine)
+    migrations = {
+        "documents": {
+            "owner_id": "VARCHAR(255)",
+            "department": "VARCHAR(255)",
+            "doc_id": "VARCHAR(255)",
+        },
+    }
+    with engine.begin() as connection:
+        for table, columns in migrations.items():
+            if table not in inspector.get_table_names():
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for column, sql_type in columns.items():
+                if column not in existing:
+                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))

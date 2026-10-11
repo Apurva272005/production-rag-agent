@@ -2,11 +2,15 @@ import os
 os.environ["NLTK_DISABLE_IMPORT_SECURITY"] = "1"
 import shutil
 import io
+import json
+import logging
 import time
+from urllib.parse import urlencode
 from datetime import timedelta, datetime
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Response, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Response, status, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from sqlalchemy.orm import Session
@@ -29,15 +33,14 @@ except Exception:
     except Exception:
         pymupdf = None
 
-from database import get_db, SessionLocal, Base, engine
-from models_db import User, DocumentRecord, QueryLog
-from auth import (
-    get_current_user,
-    get_optional_current_user,
-    require_role,
-    init_default_users,
-)
-from routers import auth_routes
+from database import get_db, SessionLocal, Base, engine, ensure_rbac_schema
+from models_db import AuditLog, DocumentRecord, QueryLog
+from clerk_auth import CurrentUser, get_current_user, get_current_token, record_revoked_token, require_roles
+from rbac_filters import build_access_filter
+from routers.clerk_admin_routes import router as clerk_admin_router
+from routers.clerk_webhook_routes import router as clerk_webhook_router
+from clerk_api import ClerkAPIError, ClerkConfigurationError, check_connection, list_users, revoke_session, secret_diagnostics, validate_clerk_secret
+from clerk_policy import validate_domain_settings
 from custom_types import (
     AskRequest,
     AskResponse,
@@ -49,15 +52,18 @@ from custom_types import (
 from data_loader import load_and_chunk_pdf_structured, embed_texts
 from vector_db import get_qdrant_storage
 
+logger = logging.getLogger("rag_api")
+
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+validate_clerk_secret()
+validate_domain_settings()
 
 STORAGE_DIR = os.path.join(os.path.dirname(__file__), "storage")
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
-# Initialize Database tables and default accounts
+# Initialize database tables. Clerk is the identity and role source of truth.
 Base.metadata.create_all(bind=engine)
-with SessionLocal() as init_session:
-    init_default_users(init_session)
+ensure_rbac_schema()
 
 DEFAULT_OPENROUTER_MODELS = [
     "minimax/minimax-m3:free",
@@ -68,6 +74,7 @@ DEFAULT_OPENROUTER_MODELS = [
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
 ]
+QUERY_RATE_LIMIT_PER_MINUTE = int(os.getenv("QUERY_RATE_LIMIT_PER_MINUTE", "30"))
 
 
 def get_openrouter_models() -> list[str]:
@@ -123,12 +130,75 @@ def build_chat_messages(question: str, context_block: str, has_context: bool) ->
     ]
 
 
+def document_is_accessible(user: CurrentUser, document: DocumentRecord) -> bool:
+    if user.role == "admin":
+        return True
+    if document.visibility in {"public", "student"}:
+        return True
+    if user.role != "faculty" or document.visibility != "faculty":
+        return False
+    return document.owner_id == user.id or (
+        bool(user.department) and document.department == user.department
+    )
+
+
+def document_is_manageable(user: CurrentUser, document: DocumentRecord) -> bool:
+    if user.role == "admin":
+        return True
+    return (
+        user.role == "faculty"
+        and document.owner_id == user.id
+        and document.department == user.department
+    )
+
+
+def validate_ingest_scope(user: CurrentUser, visibility: str, department: Optional[str]) -> str:
+    allowed = {"public", "student", "faculty", "admin"}
+    if visibility not in allowed:
+        raise HTTPException(status_code=400, detail=f"visibility must be one of {sorted(allowed)}")
+    if user.role == "faculty":
+        if visibility == "admin":
+            raise HTTPException(status_code=403, detail="Faculty cannot ingest admin-only documents")
+        if not user.department:
+            raise HTTPException(status_code=403, detail="Faculty account has no department assigned")
+        if department and department != user.department:
+            raise HTTPException(status_code=403, detail="Faculty can only manage their own department")
+        return user.department
+    return department or user.department or ""
+
+
+def enforce_query_rate_limit(db: Session, user: CurrentUser) -> None:
+    cutoff = datetime.utcnow() - timedelta(minutes=1)
+    recent = (
+        db.query(QueryLog)
+        .filter(QueryLog.user_id == user.id, QueryLog.timestamp >= cutoff)
+        .count()
+    )
+    if recent >= QUERY_RATE_LIMIT_PER_MINUTE:
+        raise HTTPException(status_code=429, detail="Query rate limit exceeded; try again shortly")
+
+
+def write_audit(db: Session, user: CurrentUser, action: str, resource_id: Optional[str], details: str = "") -> None:
+    db.add(
+        AuditLog(
+            actor_id=user.id,
+            actor_role=user.role,
+            action=action,
+            resource_id=resource_id,
+            details=details,
+        )
+    )
+    db.commit()
+
+
 def ingest_pdf_file(
     pdf_path: str,
     source_id: str,
     visibility: str = "public",
     uploaded_by: str = "system",
     replace_existing: bool = True,
+    owner_id: Optional[str] = None,
+    department: Optional[str] = None,
     db: Optional[Session] = None,
 ) -> IngestResult:
     """Ingests PDF, computes embeddings, indexes into Qdrant, records in DB, and stores file for preview."""
@@ -149,6 +219,9 @@ def ingest_pdf_file(
         chunks=structured_chunks,
         vectors=vectors,
         visibility=visibility,
+        owner_id=owner_id,
+        department=department,
+        doc_id=source_id,
     )
 
     # Persist PDF file to storage directory for Phase 3 page preview
@@ -173,6 +246,9 @@ def ingest_pdf_file(
                 file_name=os.path.basename(pdf_path),
                 uploaded_by=uploaded_by,
                 visibility=visibility,
+                owner_id=owner_id,
+                department=department,
+                doc_id=source_id,
                 file_path=dest_path,
                 chunks_count=count,
             )
@@ -182,13 +258,16 @@ def ingest_pdf_file(
             doc_record.uploaded_by = uploaded_by
             doc_record.file_path = dest_path
             doc_record.chunks_count = count
+            doc_record.owner_id = owner_id
+            doc_record.department = department
+            doc_record.doc_id = source_id
             doc_record.uploaded_at = datetime.utcnow()
         db.commit()
     finally:
         if should_close_db:
             db.close()
 
-    return IngestResult(status="success", source_id=source_id, chunks_ingested=count, visibility=visibility)
+    return IngestResult(status="success", source_id=source_id, chunks_ingested=count, visibility=visibility, department=department)
 
 
 # ── Inngest Client & Async Ingestion Workflow ───────────────────────────────
@@ -216,9 +295,16 @@ async def ingest_pdf(ctx: inngest.Context, step: inngest.Step) -> Dict[str, Any]
     pdf_path = ctx.event.data.get("pdf_path")
     source_id = ctx.event.data.get("source_id")
     visibility = ctx.event.data.get("visibility", "public")
+    owner_id = ctx.event.data.get("user_id")
+    role = ctx.event.data.get("role", "student")
+    department = ctx.event.data.get("department")
 
     if not pdf_path or not source_id:
         raise ValueError("Missing pdf_path or source_id in event data")
+    if role not in {"admin", "faculty"}:
+        raise ValueError("Ingestion event is not authorized")
+    if role == "faculty" and visibility == "admin":
+        raise ValueError("Faculty cannot ingest admin-only documents")
 
     if not os.path.exists(pdf_path):
         return {
@@ -240,7 +326,15 @@ async def ingest_pdf(ctx: inngest.Context, step: inngest.Step) -> Dict[str, Any]
         store = get_qdrant_storage()
         if replace_existing:
             store.delete_source(source_id)
-        return store.upsert_chunks(source_id, chunks, vectors, visibility=visibility)
+        return store.upsert_chunks(
+            source_id,
+            chunks,
+            vectors,
+            visibility=visibility,
+            owner_id=owner_id,
+            department=department,
+            doc_id=source_id,
+        )
 
     count = await step.run("store-qdrant", _store)
     return IngestResult(status="success", source_id=source_id, chunks_ingested=count, visibility=visibility).model_dump()
@@ -253,25 +347,46 @@ app = FastAPI(
     version="2.0.0",
 )
 
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        os.getenv("STREAMLIT_URL", "http://127.0.0.1:8501"),
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Mount Auth router
-app.include_router(auth_routes.router)
+# Mount Clerk admin routes. There is intentionally no local password-login router.
+app.include_router(clerk_admin_router)
+app.include_router(clerk_webhook_router)
 
 
 @app.get("/")
-async def root():
+async def root(request: Request):
+    clerk_params = [
+        (key, value)
+        for key, value in request.query_params.multi_items()
+        if key.startswith("__clerk") or key.startswith("_clerk")
+    ]
+    if clerk_params:
+        streamlit_url = os.getenv("STREAMLIT_URL", "http://127.0.0.1:8501").rstrip("/")
+        return RedirectResponse(
+            url=f"{streamlit_url}/?{urlencode(clerk_params)}",
+            status_code=302,
+        )
     return {
         "status": "online",
         "service": "RAG Institute Assistant API",
         "version": "2.0.0",
-        "endpoints": ["/auth/login", "/ingest", "/upload", "/upload-batch", "/ask", "/sources", "/preview", "/export", "/admin/dashboard", "/docs", "/health"],
+        "endpoints": ["/auth/clerk", "/ingest", "/upload", "/upload-batch", "/ask", "/sources", "/preview", "/export", "/admin/users", "/admin/roles", "/admin/logs", "/docs", "/health"],
     }
 
 
@@ -280,44 +395,148 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/health/clerk")
+async def clerk_health(request: Request):
+    """Local-only Clerk connectivity probe with safe, actionable reason codes."""
+    client_host = request.client.host if request.client else None
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=403, detail="Local access only")
+    try:
+        check_connection()
+    except ClerkConfigurationError as exc:
+        logger.exception("Clerk health check configuration failure")
+        return Response(
+            content=json.dumps({"status": "failed", "reason": "server_misconfigured", "message": str(exc)}),
+            status_code=500,
+            media_type="application/json",
+        )
+    except ClerkAPIError as exc:
+        logger.exception("Clerk health check failed: %s: %s", type(exc).__name__, str(exc))
+        reason = "invalid_secret" if exc.reason == "invalid_secret" else "auth_service_unavailable"
+        return Response(
+            content=json.dumps({"status": "failed", "reason": reason}),
+            status_code=503 if reason == "auth_service_unavailable" else 502,
+            media_type="application/json",
+        )
+    return {"status": "ok", "reason": "ok"}
+
+
+@app.get("/auth/clerk", response_class=HTMLResponse, include_in_schema=False)
+async def clerk_sign_in(request: Request):
+    publishable_key = os.getenv("CLERK_PUBLISHABLE_KEY", "")
+    frontend_api_url = os.getenv("CLERK_ISSUER", "").rstrip("/")
+    streamlit_url = os.getenv("STREAMLIT_URL", "http://127.0.0.1:8501")
+    fastapi_url = os.getenv("FASTAPI_BASE_URL", str(request.base_url)).rstrip("/")
+    auth_callback_url = f"{fastapi_url}/auth/clerk"
+    template = os.getenv("CLERK_JWT_TEMPLATE", "rag-api")
+    force_sign_out = request.query_params.get("force") == "1"
+    if not publishable_key or not frontend_api_url:
+        raise HTTPException(status_code=503, detail="Clerk publishable key and issuer are required")
+    return HTMLResponse(
+        f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Sign in</title>
+<script defer crossorigin="anonymous" src="{frontend_api_url}/npm/@clerk/ui@1/dist/ui.browser.js"></script>
+<script defer crossorigin="anonymous" data-clerk-publishable-key="{publishable_key}" src="{frontend_api_url}/npm/@clerk/clerk-js@6/dist/clerk.browser.js"></script>
+</head><body><div id="clerk-sign-in"></div><p id="status">Loading secure sign-in...</p>
+<script>
+const returnUrl = {streamlit_url!r};
+const authCallbackUrl = {auth_callback_url!r};
+const template = {template!r};
+const forceSignOut = {str(force_sign_out).lower()};
+window.addEventListener('load', async () => {{
+  try {{
+    await Clerk.load({{ ui: {{ ClerkUI: window.__internal_ClerkUICtor }} }});
+    if (forceSignOut && Clerk.session) {{
+      await Clerk.signOut();
+    }}
+    if (!Clerk.session) {{
+      Clerk.mountSignIn(document.getElementById('clerk-sign-in'), {{
+        signInForceRedirectUrl: authCallbackUrl,
+        signInFallbackRedirectUrl: authCallbackUrl,
+        signUpForceRedirectUrl: authCallbackUrl,
+        signUpFallbackRedirectUrl: authCallbackUrl
+      }});
+      document.getElementById('status').textContent = 'Sign in with your institute account.';
+      return;
+    }}
+    const token = await Clerk.session.getToken({{ template }});
+    window.location.replace(returnUrl + '?clerk_token=' + encodeURIComponent(token));
+  }} catch (error) {{
+    document.getElementById('status').textContent = 'Unable to load Clerk sign-in: ' + error.message;
+  }}
+}});
+</script></body></html>"""
+    )
+
+
+@app.post("/auth/logout")
+async def clerk_logout(
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+    token: str = Depends(get_current_token),
+):
+    """Revoke both the Clerk session and this exact token before clearing the UI."""
+    record_revoked_token(db, token, current_user.claims, current_user.id)
+    session_id = current_user.claims.get("sid")
+    if session_id:
+        try:
+            revoke_session(session_id)
+        except Exception:
+            # The local denylist still blocks this token if Clerk is temporarily unavailable.
+            pass
+    write_audit(db, current_user, "logout", session_id)
+    return {"status": "logged_out"}
+
+
+@app.get("/auth/me")
+async def clerk_me(current_user: CurrentUser = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "role": current_user.role,
+        "department": current_user.department,
+    }
+
+
 @app.get("/sources")
 async def sources(
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     store = get_qdrant_storage()
-    is_restricted = (current_user is None or current_user.role == "student")
-    
-    if is_restricted:
-        public_docs = db.query(DocumentRecord.source_id).filter(DocumentRecord.visibility == "public").all()
-        public_ids = [d[0] for d in public_docs]
-        qdrant_sources = store.list_sources(visibility="public")
-        all_public = sorted(list(set(public_ids + qdrant_sources)))
-        return {"sources": all_public}
-
-    all_docs = db.query(DocumentRecord.source_id).all()
-    db_ids = [d[0] for d in all_docs]
-    qdrant_sources = store.list_sources()
-    return {"sources": sorted(list(set(db_ids + qdrant_sources)))}
+    access_filter = build_access_filter(current_user)
+    qdrant_sources = store.list_sources(access_filter=access_filter)
+    db_sources = []
+    for document in db.query(DocumentRecord).all():
+        if document_is_accessible(current_user, document):
+            db_sources.append(document.source_id)
+    return {"sources": sorted(set(qdrant_sources + db_sources))}
 
 
 @app.post("/ingest", response_model=IngestResult)
 async def ingest(
     req: IngestPDFData,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "faculty")),
+    current_user: CurrentUser = Depends(require_roles("admin", "faculty")),
 ) -> IngestResult:
     try:
-        return ingest_pdf_file(
+        department = validate_ingest_scope(current_user, req.visibility, req.department)
+        result = ingest_pdf_file(
             pdf_path=req.pdf_path,
             source_id=req.source_id,
             visibility=req.visibility,
-            uploaded_by=current_user.email,
+            uploaded_by=current_user.id,
             replace_existing=req.replace_existing,
+            owner_id=current_user.id,
+            department=department,
             db=db,
         )
+        write_audit(db, current_user, "ingest", req.source_id, f"visibility={req.visibility}; department={department}")
+        return result
     except FileNotFoundError as err:
         raise HTTPException(status_code=404, detail=str(err))
+    except HTTPException:
+        raise
     except Exception as err:
         raise HTTPException(status_code=500, detail=f"PDF ingestion failed: {err}")
 
@@ -327,27 +546,35 @@ async def upload_file(
     file: UploadFile = File(...),
     source_id: Optional[str] = Form(None),
     visibility: str = Form("public"),
+    department: Optional[str] = Form(None),
     replace_existing: bool = Form(True),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "faculty")),
+    current_user: CurrentUser = Depends(require_roles("admin", "faculty")),
 ) -> IngestResult:
     target_source = source_id or os.path.splitext(file.filename)[0]
     target_source = "".join(c if (c.isalnum() or c in "_-") else "_" for c in target_source)
     storage_path = os.path.join(STORAGE_DIR, f"{target_source}.pdf")
 
     try:
+        department = validate_ingest_scope(current_user, visibility, department)
         content = await file.read()
         with open(storage_path, "wb") as f:
             f.write(content)
 
-        return ingest_pdf_file(
+        result = ingest_pdf_file(
             pdf_path=storage_path,
             source_id=target_source,
             visibility=visibility,
-            uploaded_by=current_user.email,
+            uploaded_by=current_user.id,
             replace_existing=replace_existing,
+            owner_id=current_user.id,
+            department=department,
             db=db,
         )
+        write_audit(db, current_user, "ingest", target_source, f"visibility={visibility}; department={department}")
+        return result
+    except HTTPException:
+        raise
     except Exception as err:
         raise HTTPException(status_code=500, detail=f"File upload failed: {err}")
 
@@ -357,8 +584,9 @@ async def upload_multiple_files(
     files: List[UploadFile] = File(...),
     visibility: str = Form("public"),
     replace_existing: bool = Form(True),
+    department: Optional[str] = Form(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "faculty")),
+    current_user: CurrentUser = Depends(require_roles("admin", "faculty")),
 ) -> Dict[str, Any]:
     results = []
     total_chunks = 0
@@ -367,6 +595,7 @@ async def upload_multiple_files(
         target_source = "".join(c if (c.isalnum() or c in "_-") else "_" for c in raw_name)
         storage_path = os.path.join(STORAGE_DIR, f"{target_source}.pdf")
         try:
+            department = validate_ingest_scope(current_user, visibility, department)
             content = await file.read()
             with open(storage_path, "wb") as f:
                 f.write(content)
@@ -375,10 +604,13 @@ async def upload_multiple_files(
                 pdf_path=storage_path,
                 source_id=target_source,
                 visibility=visibility,
-                uploaded_by=current_user.email,
+                uploaded_by=current_user.id,
                 replace_existing=replace_existing,
+                owner_id=current_user.id,
+                department=department,
                 db=db,
             )
+            write_audit(db, current_user, "ingest", target_source, f"visibility={visibility}; department={department}")
             results.append(res.model_dump())
             total_chunks += res.chunks_ingested
         except Exception as err:
@@ -392,11 +624,31 @@ async def upload_multiple_files(
     }
 
 
+@app.delete("/documents/{source_id}")
+async def delete_document(
+    source_id: str,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(require_roles("admin", "faculty")),
+):
+    document = db.query(DocumentRecord).filter(DocumentRecord.source_id == source_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if not document_is_manageable(current_user, document):
+        raise HTTPException(status_code=403, detail="You can only delete documents within your ownership or department scope")
+    get_qdrant_storage().delete_source(source_id)
+    if document.file_path and os.path.exists(document.file_path):
+        os.unlink(document.file_path)
+    db.delete(document)
+    db.commit()
+    write_audit(db, current_user, "delete", source_id)
+    return {"status": "deleted", "source_id": source_id}
+
+
 @app.post("/ask", response_model=AskResponse)
 async def ask(
     req: AskRequest,
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> AskResponse:
     # 1. Embed query
     query_vecs = embed_texts([req.question])
@@ -404,21 +656,15 @@ async def ask(
         raise HTTPException(status_code=400, detail="Failed to generate query embedding.")
     query_vec = query_vecs[0]
 
-    # 2. RBAC Visibility Filter: Students MUST only retrieve public chunks server-side
-    visibility_filter = None
-    if current_user is None or current_user.role == "student":
-        visibility_filter = "public"
-
     raw_source = getattr(req, "source_id", None)
     source_id = raw_source.strip() if raw_source and isinstance(raw_source, str) else None
 
-    # If student explicitly asked for a private source, block it server-side
-    if visibility_filter == "public" and source_id and source_id != "All documents":
+    if source_id and source_id != "All documents":
         doc_record = db.query(DocumentRecord).filter(DocumentRecord.source_id == source_id).first()
-        if doc_record and doc_record.visibility == "private":
+        if doc_record and not document_is_accessible(current_user, doc_record):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access forbidden: Document '{source_id}' is private and restricted from student role.",
+                detail=f"Access forbidden: Document '{source_id}' is outside your role or department scope.",
             )
 
     # 3. Query Qdrant
@@ -427,7 +673,7 @@ async def ask(
         query_vector=query_vec,
         top_k=req.top_k,
         source_id=source_id,
-        visibility=visibility_filter,
+        access_filter=build_access_filter(current_user),
     )
 
     contexts = found.get("contexts", [])
@@ -448,8 +694,9 @@ async def ask(
         )
 
     # Log query to database
-    user_identifier = current_user.email if current_user else "anonymous"
-    user_role_str = current_user.role if current_user else "guest"
+    enforce_query_rate_limit(db, current_user)
+    user_identifier = current_user.id
+    user_role_str = current_user.role
     try:
         q_log = QueryLog(
             user_id=user_identifier,
@@ -568,18 +815,17 @@ async def preview_page(
     source_id: str,
     page_number: int,
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """Renders a high-resolution PNG image of the requested PDF page with RBAC validation."""
     doc_record = db.query(DocumentRecord).filter(DocumentRecord.source_id == source_id).first()
     
     # Check visibility permissions
-    if doc_record and doc_record.visibility == "private":
-        if current_user is None or current_user.role == "student":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access forbidden: You do not have permission to view pages of this private document.",
-            )
+    if doc_record and not document_is_accessible(current_user, doc_record):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: document is outside your role or department scope",
+        )
 
     pdf_path = os.path.join(STORAGE_DIR, f"{source_id}.pdf")
     if not os.path.exists(pdf_path):
@@ -609,7 +855,7 @@ async def preview_page(
 @app.post("/export")
 async def export_answer_pdf(
     req: ExportRequest,
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """Generates a professional PDF report containing question, grounded answer, and citations."""
     buffer = io.BytesIO()
@@ -660,7 +906,7 @@ async def export_answer_pdf(
 
     # Header
     story.append(Paragraph("📄 RAG Institute Assistant — Q&A Report", title_style))
-    user_email = current_user.email if current_user else "Authenticated User"
+    user_email = current_user.email or current_user.id
     timestamp_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     story.append(Paragraph(f"Exported for: <b>{user_email}</b> • Generated on: <b>{timestamp_str}</b>", meta_style))
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#E2E8F0"), spaceAfter=12))
@@ -725,11 +971,14 @@ async def export_answer_pdf(
 @app.get("/admin/dashboard")
 async def admin_dashboard(
     db: Session = Depends(get_db),
-    admin: User = Depends(require_role("admin")),
+    admin: CurrentUser = Depends(require_roles("admin")),
 ):
     """Admin-only analytics dashboard aggregating query volume, sources, and user activity."""
     total_queries = db.query(QueryLog).count()
-    total_users = db.query(User).count()
+    try:
+        total_users = len(list_users(limit=100))
+    except Exception:
+        total_users = 0
     total_documents = db.query(DocumentRecord).count()
     public_documents = db.query(DocumentRecord).filter(DocumentRecord.visibility == "public").count()
     private_documents = db.query(DocumentRecord).filter(DocumentRecord.visibility == "private").count()

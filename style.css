@@ -1,0 +1,57 @@
+:root {
+  --portal-accent: #087f8c;
+  --portal-accent-strong: #05636e;
+  --portal-teal-soft: #dff4f3;
+  --portal-ink: #102a43;
+  --portal-muted: #627d98;
+  --portal-surface: #ffffff;
+  --portal-surface-muted: #edf4f7;
+  --portal-border: #d9e2ec;
+  --portal-shadow: 0 12px 30px rgba(16, 42, 67, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --portal-ink: #e6eef5;
+    --portal-muted: #9fb3c8;
+    --portal-surface: #151c24;
+    --portal-surface-muted: #202a35;
+    --portal-border: #344454;
+    --portal-shadow: 0 12px 30px rgba(0, 0, 0, 0.24);
+  }
+}
+
+.block-container { padding-top: 2.4rem; padding-bottom: 4rem; max-width: 1440px; }
+[data-testid="stSidebar"] { border-right: 1px solid var(--portal-border); }
+[data-testid="stSidebar"] > div:first-child { padding-top: 1.5rem; }
+[data-testid="stToolbar"], footer { visibility: hidden; }
+
+.portal-eyebrow { color: var(--portal-accent); font-size: 0.75rem; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+.portal-title { color: var(--portal-ink); font-size: clamp(2rem, 4vw, 3.5rem); font-weight: 780; line-height: 1.05; letter-spacing: 0; margin: .35rem 0 .75rem; }
+.portal-subtitle { color: var(--portal-muted); font-size: 1.02rem; line-height: 1.6; max-width: 760px; }
+.portal-card { background: var(--portal-surface); border: 1px solid var(--portal-border); border-radius: 14px; box-shadow: var(--portal-shadow); padding: 1.2rem 1.3rem; }
+.portal-card-flat { background: var(--portal-surface-muted); border: 1px solid var(--portal-border); border-radius: 12px; padding: 1rem 1.1rem; }
+.portal-hero { background: var(--portal-surface); border: 1px solid var(--portal-border); border-radius: 20px; box-shadow: var(--portal-shadow); padding: clamp(2rem, 7vw, 5rem) clamp(1.4rem, 5vw, 4.5rem); text-align: center; }
+.portal-hero .portal-subtitle { margin: 0 auto; }
+.portal-mark { align-items: center; background: var(--portal-teal-soft); border-radius: 16px; color: var(--portal-accent-strong); display: inline-flex; font-size: 2.2rem; height: 4.5rem; justify-content: center; margin-bottom: .9rem; width: 4.5rem; }
+.portal-alert { border-left: 4px solid var(--portal-accent); background: var(--portal-surface-muted); border-radius: 10px; color: var(--portal-ink); padding: .9rem 1rem; margin: 1rem 0; }
+.portal-alert.error { border-left-color: #d64545; }
+.portal-alert.warning { border-left-color: #d99a22; }
+.profile-card { background: var(--portal-surface-muted); border: 1px solid var(--portal-border); border-radius: 14px; padding: 1rem; }
+.profile-avatar { align-items: center; background: var(--portal-accent); border-radius: 50%; color: white; display: inline-flex; font-size: 1rem; font-weight: 750; height: 2.5rem; justify-content: center; margin-right: .65rem; width: 2.5rem; }
+.profile-name { color: var(--portal-ink); font-weight: 700; vertical-align: middle; }
+.profile-email { color: var(--portal-muted); font-size: .78rem; overflow-wrap: anywhere; margin-top: .45rem; }
+.role-badge { border-radius: 999px; display: inline-block; font-size: .7rem; font-weight: 750; letter-spacing: .04em; padding: .25rem .55rem; text-transform: uppercase; }
+.role-admin { background: #fee2e2; color: #991b1b; }
+.role-faculty { background: #dbeafe; color: #1d4ed8; }
+.role-student { background: #d1fae5; color: #047857; }
+.stat-value { color: var(--portal-ink); font-size: 1.7rem; font-weight: 760; }
+.stat-label { color: var(--portal-muted); font-size: .82rem; margin-top: .2rem; }
+.chat-user { background: var(--portal-teal-soft); border-radius: 14px 14px 4px 14px; padding: .9rem 1rem; margin: .45rem 0 .7rem auto; max-width: 82%; }
+.chat-assistant { background: var(--portal-surface); border: 1px solid var(--portal-border); border-radius: 14px 14px 14px 4px; box-shadow: 0 6px 18px rgba(16,42,67,.06); padding: 1rem 1.1rem; max-width: 92%; }
+.source-card { background: var(--portal-surface-muted); border: 1px solid var(--portal-border); border-radius: 10px; padding: .7rem .85rem; }
+.source-title { color: var(--portal-ink); font-weight: 700; }
+.source-meta { color: var(--portal-muted); font-size: .8rem; margin-top: .25rem; }
+.empty-state { color: var(--portal-muted); padding: 2rem 1rem; text-align: center; }
+.stButton > button, .stDownloadButton > button { border-radius: 9px; font-weight: 650; }
+.stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"] > div { border-radius: 9px; }
